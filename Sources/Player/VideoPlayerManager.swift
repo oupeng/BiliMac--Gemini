@@ -115,8 +115,10 @@ final class VideoPlayerManager: ObservableObject {
                 self.applyVolume()
                 if resumeTime > 0 {
                     let t = CMTime(seconds: resumeTime, preferredTimescale: 600)
-                    self.videoPlayer.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
-                    self.audioPlayer?.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                    await self.videoPlayer.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                    if let audio = self.audioPlayer {
+                        await audio.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                    }
                 }
                 
                 self.play()
