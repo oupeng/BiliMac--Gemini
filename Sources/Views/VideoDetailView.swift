@@ -10,9 +10,12 @@ struct VideoDetailView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部返回导航栏
+            // 顶部导航条
             HStack {
-                Button(action: onBack) {
+                Button(action: {
+                    playerManager.cleanup() // 🌟 返回前立即停播断流
+                    onBack()
+                }) {
                     HStack(spacing: 4) {
                         Image(systemName: "chevron.left")
                         Text("返回")
@@ -34,7 +37,7 @@ struct VideoDetailView: View {
             
             Divider()
             
-            // 详情主体左右分栏
+            // 详情主体分栏
             HSplitView {
                 // 左侧：播放器 + 信息 + 画质选择 + 相关推荐
                 VStack(spacing: 0) {
@@ -44,7 +47,6 @@ struct VideoDetailView: View {
                     
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
-                            // 标题与画质切换栏
                             HStack(alignment: .top) {
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text(detail?.title ?? videoItem.title)
@@ -62,7 +64,7 @@ struct VideoDetailView: View {
                                 
                                 Spacer()
                                 
-                                // 🌟 清晰度选择器：原生精致菜单，不遮挡视频画面
+                                // 清晰度选择器
                                 if !playerManager.availableQualities.isEmpty {
                                     Picker("", selection: Binding(
                                         get: { playerManager.selectedQualityId },
@@ -73,7 +75,7 @@ struct VideoDetailView: View {
                                         }
                                     }
                                     .pickerStyle(.menu)
-                                    .frame(width: 120)
+                                    .frame(width: 125)
                                 }
                             }
                             
@@ -83,7 +85,7 @@ struct VideoDetailView: View {
                             
                             Divider().padding(.vertical, 4)
                             
-                            Text("相关视频推荐")
+                            Text("相关推荐")
                                 .font(.headline)
                             
                             LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], spacing: 12) {
@@ -128,6 +130,10 @@ struct VideoDetailView: View {
         .task {
             loadDetail(bvid: videoItem.bvid)
         }
+        // 🌟 视图离开时彻底熔断，禁止任何后台偷跑流量
+        .onDisappear {
+            playerManager.cleanup()
+        }
     }
     
     private func loadDetail(bvid: String) {
@@ -143,6 +149,7 @@ struct VideoDetailView: View {
     }
     
     private func switchVideo(_ item: VideoItem) {
+        playerManager.cleanup() // 切换视频时重置
         loadDetail(bvid: item.bvid)
     }
 }
