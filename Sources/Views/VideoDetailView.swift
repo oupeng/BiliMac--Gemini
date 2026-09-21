@@ -10,10 +10,14 @@ struct VideoDetailView: View {
     
     var body: some View {
         VStack(spacing: 0) {
-            // 顶部导航返回条
+            // 顶部返回导航栏
             HStack {
                 Button(action: onBack) {
-                    Label("返回", systemImage: "chevron.left")
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.left")
+                        Text("返回")
+                    }
+                    .font(.system(size: 13, weight: .medium))
                 }
                 .buttonStyle(.plain)
                 .padding(.leading, 16)
@@ -25,14 +29,14 @@ struct VideoDetailView: View {
                     .frame(maxWidth: 500)
                 Spacer()
             }
-            .frame(height: 40)
+            .frame(height: 38)
             .background(Color(NSColor.windowBackgroundColor))
             
             Divider()
             
-            // 详情主体：左侧 视频+推荐，右侧 评论区
+            // 详情主体左右分栏
             HSplitView {
-                // 左侧面板
+                // 左侧：播放器 + 信息 + 画质选择 + 相关推荐
                 VStack(spacing: 0) {
                     CustomPlayerView(playerManager: playerManager)
                         .aspectRatio(16/9, contentMode: .fit)
@@ -40,15 +44,37 @@ struct VideoDetailView: View {
                     
                     ScrollView {
                         VStack(alignment: .leading, spacing: 14) {
-                            Text(detail?.title ?? videoItem.title)
-                                .font(.title3.bold())
-                            
-                            HStack(spacing: 12) {
-                                Text(detail?.ownerName ?? videoItem.ownerName)
-                                    .font(.subheadline.bold())
-                                Text("播放 \(detail?.viewCount ?? 0)  点赞 \(detail?.likeCount ?? 0)")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
+                            // 标题与画质切换栏
+                            HStack(alignment: .top) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(detail?.title ?? videoItem.title)
+                                        .font(.title3.bold())
+                                    
+                                    HStack(spacing: 12) {
+                                        Text(detail?.ownerName ?? videoItem.ownerName)
+                                            .font(.subheadline.bold())
+                                            .foregroundColor(.secondary)
+                                        Text("播放 \(detail?.viewCount ?? 0)  点赞 \(detail?.likeCount ?? 0)")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                
+                                Spacer()
+                                
+                                // 🌟 清晰度选择器：原生精致菜单，不遮挡视频画面
+                                if !playerManager.availableQualities.isEmpty {
+                                    Picker("", selection: Binding(
+                                        get: { playerManager.selectedQualityId },
+                                        set: { playerManager.changeQuality(to: $0) }
+                                    )) {
+                                        ForEach(playerManager.availableQualities, id: \.id) { q in
+                                            Text(q.name).tag(q.id)
+                                        }
+                                    }
+                                    .pickerStyle(.menu)
+                                    .frame(width: 120)
+                                }
                             }
                             
                             Text(detail?.desc ?? "")
@@ -74,13 +100,13 @@ struct VideoDetailView: View {
                 }
                 .frame(minWidth: 550)
                 
-                // 右侧评论面板
+                // 右侧：只读评论区
                 VStack(spacing: 0) {
                     HStack {
                         Text("评论区")
                             .font(.headline)
                         Spacer()
-                        Text("只读模式")
+                        Text("只读")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
