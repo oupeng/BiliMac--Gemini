@@ -2,112 +2,11 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 原生防盗链与流切片拦截器
-final class BiliResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
-    static let shared = BiliResourceLoader()
-    private var tasks: [AVAssetResourceLoadingRequest: URLSessionDataTask] = [:]
-    private let loaderQueue = DispatchQueue(label: "com.bilimac.resourceloader")
-    
-    private lazy var session: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.requestCachePolicy = .reloadIgnoringLocalCacheData
-        return URLSession(configuration: config)
-    }()
-    
-    func createAsset(from originalURL: URL, isAudio: Bool = false) -> AVURLAsset {
-        var comp = URLComponents()
-        comp.scheme = "bilistream"
-        comp.host = isAudio ? "audio.mp4" : "video.mp4"
-        comp.queryItems = [URLQueryItem(name: "real_url", value: originalURL.absoluteString)]
-        
-        guard let proxyURL = comp.url else {
-            return AVURLAsset(url: originalURL)
-        }
-        
-        let asset = AVURLAsset(url: proxyURL)
-        asset.resourceLoader.setDelegate(self, queue: loaderQueue)
-        return asset
-    }
-    
-    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
-        guard let url = loadingRequest.request.url,
-              let comp = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let realUrlStr = comp.queryItems?.first(where: { $0.name == "real_url" })?.value,
-              let realURL = URL(string: realUrlStr) else {
-            return false
-        }
-        
-        var request = URLRequest(url: realURL)
-        request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
-        
-        let cookie = CookieManager.shared.cookieHeader
-        if !cookie.isEmpty {
-            request.setValue(cookie, forHTTPHeaderField: "Cookie")
-        }
-        
-        if let dataRequest = loadingRequest.dataRequest {
-            let offset = dataRequest.requestedOffset
-            let length = dataRequest.requestedLength
-            if length > 0 {
-                request.setValue("bytes=\(offset)-\(offset + Int64(length) - 1)", forHTTPHeaderField: "Range")
-            } else {
-                request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
-            }
-        }
-        
-        let task = session.dataTask(with: request) { [weak self, weak loadingRequest] data, response, error in
-            guard let self = self, let loadingRequest = loadingRequest else { return }
-            
-            self.loaderQueue.async {
-                if let error = error {
-                    if (error as NSError).code != NSURLErrorCancelled {
-                        loadingRequest.finishLoading(with: error)
-                    }
-                    return
-                }
-                
-                if let httpResponse = response as? HTTPURLResponse {
-                    if let contentInfo = loadingRequest.contentInformationRequest {
-                        contentInfo.isByteRangeAccessSupported = true
-                        contentInfo.contentType = "public.mpeg-4"
-                        
-                        if let rangeStr = httpResponse.allHeaderFields["Content-Range"] as? String ?? httpResponse.allHeaderFields["content-range"] as? String,
-                           let total = rangeStr.split(separator: "/").last,
-                           let totalLength = Int64(total.trimmingCharacters(in: .whitespaces)) {
-                            contentInfo.contentLength = totalLength
-                        } else if httpResponse.expectedContentLength > 0 {
-                            contentInfo.contentLength = httpResponse.expectedContentLength
-                        }
-                    }
-                }
-                
-                if let data = data, let dataRequest = loadingRequest.dataRequest {
-                    dataRequest.respond(with: data)
-                }
-                
-                loadingRequest.finishLoading()
-                self.tasks.removeValue(forKey: loadingRequest)
-            }
-        }
-        
-        tasks[loadingRequest] = task
-        task.resume()
-        return true
-    }
-    
-    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
-        tasks[loadingRequest]?.cancel()
-        tasks.removeValue(forKey: loadingRequest)
-    }
-}
-
-// MARK: - 播放控制器核心管理器
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
-    @Published var currentQualityName: String = "加载中..."
+    @Published var currentQualityName: String = "1080P60"
     @Published var availableQualities: [(id: Int, name: String)] = []
-    @Published var selectedQualityId: Int = 116 // 优先尝试最高画质 1080P60
+    @Published var selectedQualityId: Int = 116
     
     let videoPlayer = AVPlayer()
     private var audioPlayer: AVPlayer?
@@ -121,7 +20,7 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
-        // 自动记忆音量调节
+        // 自动记忆音量
         videoPlayer.publisher(for: \.volume)
             .sink { [weak self] vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
@@ -133,7 +32,6 @@ final class VideoPlayerManager: ObservableObject {
     }
     
     private func setupSyncObserver() {
-        // 双轨精准对齐时钟
         let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserverToken = videoPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self = self, let audio = self.audioPlayer else { return }
@@ -178,29 +76,41 @@ final class VideoPlayerManager: ObservableObject {
                 self.selectedQualityId = activeQn
                 self.currentQualityName = list.first(where: { $0.0 == activeQn })?.1 ?? "\(activeQn)P"
                 
-                guard let dash = playInfo.dash else { return }
+                // 优先选取单文件 MP4 或 DASH
+                let headers: [String: String] = [
+                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+                    "Referer": "https://www.bilibili.com"
+                ]
                 
-                let candidates = dash.video.filter { $0.id == activeQn }
-                
-                // 🌟 彻底排除 AV1！强制锁定 Intel i5 核显完全硬解的 AVC/H.264，极大降低 CPU 负载与发热
-                let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
-                    ?? candidates.first(where: { ($0.codecs ?? "").lowercased().contains("hev") })
-                    ?? candidates.first(where: { !($0.codecs ?? "").lowercased().contains("av01") })
-                    ?? dash.video.first!
-                
-                guard let vUrl = URL(string: vStream.baseUrl) else { return }
-                let vAsset = BiliResourceLoader.shared.createAsset(from: vUrl, isAudio: false)
-                let vItem = AVPlayerItem(asset: vAsset)
-                
-                self.videoPlayer.replaceCurrentItem(with: vItem)
-                
-                // 挂载音频轨（AAC/M4A）
-                if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
-                    let aAsset = BiliResourceLoader.shared.createAsset(from: aUrl, isAudio: true)
-                    let aItem = AVPlayerItem(asset: aAsset)
-                    let aPlayer = AVPlayer(playerItem: aItem)
-                    aPlayer.volume = self.videoPlayer.volume
-                    self.audioPlayer = aPlayer
+                if let durl = playInfo.durl?.first, let streamUrl = URL(string: durl.url) {
+                    // 单流 MP4 原生秒播
+                    let asset = AVURLAsset(url: streamUrl, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+                    let item = AVPlayerItem(asset: asset)
+                    self.videoPlayer.replaceCurrentItem(with: item)
+                    self.audioPlayer?.pause()
+                    self.audioPlayer = nil
+                } else if let dash = playInfo.dash {
+                    let candidates = dash.video.filter { $0.id == activeQn }
+                    
+                    // Intel i5 专用：严格锁定 AVC/H.264，彻底排除 AV1
+                    let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
+                        ?? candidates.first(where: { ($0.codecs ?? "").lowercased().contains("hev") })
+                        ?? candidates.first(where: { !($0.codecs ?? "").lowercased().contains("av01") })
+                        ?? dash.video.first!
+                    
+                    guard let vUrl = URL(string: vStream.baseUrl) else { return }
+                    let vAsset = AVURLAsset(url: vUrl, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+                    let vItem = AVPlayerItem(asset: vAsset)
+                    self.videoPlayer.replaceCurrentItem(with: vItem)
+                    
+                    // 音频轨挂载
+                    if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
+                        let aAsset = AVURLAsset(url: aUrl, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
+                        let aItem = AVPlayerItem(asset: aAsset)
+                        let aPlayer = AVPlayer(playerItem: aItem)
+                        aPlayer.volume = self.videoPlayer.volume
+                        self.audioPlayer = aPlayer
+                    }
                 }
                 
                 if resumeTime > 0 {
@@ -220,7 +130,18 @@ final class VideoPlayerManager: ObservableObject {
         }
     }
     
+    // 🌟 强力销毁方法：退出时立刻停播并切断网络下载，解决后台偷跑流量
+    func cleanup() {
+        videoPlayer.pause()
+        audioPlayer?.pause()
+        videoPlayer.replaceCurrentItem(with: nil)
+        audioPlayer?.replaceCurrentItem(with: nil)
+        audioPlayer = nil
+        isPlaying = false
+    }
+    
     deinit {
+        cleanup()
         if let token = timeObserverToken {
             videoPlayer.removeTimeObserver(token)
         }
