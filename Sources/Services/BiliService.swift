@@ -237,13 +237,14 @@ final class BiliService {
         }
     }
     
-    // MARK: - 请求完整 4K 与高画质流 (4048 破除 10 秒试看)
-    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 116) async throws -> VideoPlayUrlResponse {
+    // MARK: - 请求真 4K 流（fnval 设为 2000，强制要求 B 站下发 HEVC 4K 流，杜绝 AV1 偷换）
+    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 120) async throws -> VideoPlayUrlResponse {
         let params: [String: String] = [
             "bvid": bvid,
             "cid": "\(cid)",
             "qn": "\(qn)",
-            "fnval": "4048", // 🌟 必须传 4048，B 站服务端才会下发 20+ 分钟长片，否则当作试看给 10 秒！
+            // 🌟 2000 = 4048 - 2048。剔除 AV1 要求，迫使 B 站服务端直接返回 HEVC 4K 完整流！
+            "fnval": "2000",
             "fnver": "0",
             "fourk": "1"
         ]
