@@ -237,13 +237,13 @@ final class BiliService {
         }
     }
     
-    // MARK: - 完整 4K 与高规格流（fnval 传 4048 激活全长，杜绝 10 秒截断）
-    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 120) async throws -> VideoPlayUrlResponse {
+    // MARK: - 请求完整 4K 与高画质流 (4048 破除 10 秒试看)
+    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 116) async throws -> VideoPlayUrlResponse {
         let params: [String: String] = [
             "bvid": bvid,
             "cid": "\(cid)",
             "qn": "\(qn)",
-            "fnval": "4048", // 🌟 包含 128(4K) 与完整 DASH 标识，彻底解禁全长长视频
+            "fnval": "4048", // 🌟 必须传 4048，B 站服务端才会下发 20+ 分钟长片，否则当作试看给 10 秒！
             "fnver": "0",
             "fourk": "1"
         ]
