@@ -22,7 +22,7 @@ struct VideoCardView: View {
                 .cornerRadius(8)
                 
                 HStack(spacing: 4) {
-                    if let d = item.duration {
+                    if item.duration != nil {
                         Text(item.formattedDuration)
                             .font(.system(size: 10, weight: .bold))
                             .padding(.horizontal, 4)
