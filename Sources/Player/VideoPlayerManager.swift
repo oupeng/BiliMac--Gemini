@@ -1,120 +1,123 @@
 import Foundation
 import AVFoundation
 import Combine
-import Network
 
-// MARK: - 极速本地流式代理 (解决 .m4s 识别失败与 403 防盗链)
-final class BiliLocalProxy {
-    static let shared = BiliLocalProxy()
-    private var listener: NWListener?
-    private(set) var port: UInt16 = 0
-    private var urlMapping: [String: URL] = [:]
-    private let queue = DispatchQueue(label: "com.bilimac.proxy", qos: .userInteractive)
+// MARK: - 真实流式数据拦截器 (逐包实时喂给硬件解码器，毫秒级起播，支持退出物理熔断)
+final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
+    static let shared = BiliStreamLoader()
     
-    private init() {
-        start()
+    private var activeTasks = [URLSessionDataTask: AVAssetResourceLoadingRequest]()
+    private let queue = DispatchQueue(label: "com.bilimac.streamloader", qos: .userInteractive)
+    
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+    
+    func createAsset(from url: URL, isAudio: Bool = false) -> AVURLAsset {
+        var comp = URLComponents()
+        comp.scheme = "bilistream"
+        comp.host = isAudio ? "audio.mp4" : "video.mp4"
+        comp.queryItems = [URLQueryItem(name: "real_url", value: url.absoluteString)]
+        
+        guard let customURL = comp.url else { return AVURLAsset(url: url) }
+        let asset = AVURLAsset(url: customURL)
+        asset.resourceLoader.setDelegate(self, queue: queue)
+        return asset
     }
     
-    private func start() {
-        do {
-            let params = NWParameters.tcp
-            listener = try NWListener(using: params, on: .any)
-            listener?.stateUpdateHandler = { [weak self] state in
-                if case .ready = state, let port = self?.listener?.port?.rawValue {
-                    self?.port = port
-                }
+    // 🌟 物理断网熔断：退出时立即掐死所有网络请求，流量瞬间归零
+    func cancelAll() {
+        queue.async {
+            for (task, req) in self.activeTasks {
+                task.cancel()
+                req.finishLoading()
             }
-            listener?.newConnectionHandler = { [weak self] conn in
-                self?.handleConnection(conn)
-            }
-            listener?.start(queue: queue)
-        } catch {
-            print("代理启动失败: \(error)")
+            self.activeTasks.removeAll()
         }
     }
     
-    func proxyURL(for original: URL, isAudio: Bool = false) -> URL {
-        let key = UUID().uuidString
-        queue.sync { urlMapping[key] = original }
-        // 🌟 核心：强制伪装为 .mp4 格式，唤醒 macOS 原生硬件解码器
-        let ext = isAudio ? "audio.mp4" : "video.mp4"
-        return URL(string: "http://127.0.0.1:\(port)/\(key)/\(ext)")!
+    // MARK: - 拦截 Range 分片请求
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
+        guard let customURL = loadingRequest.request.url,
+              let comp = URLComponents(url: customURL, resolvingAgainstBaseURL: false),
+              let realUrlStr = comp.queryItems?.first(where: { $0.name == "real_url" })?.value,
+              let realURL = URL(string: realUrlStr) else {
+            return false
+        }
+        
+        var request = URLRequest(url: realURL)
+        request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Referer")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        
+        let cookie = CookieManager.shared.cookieHeader
+        if !cookie.isEmpty {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+        
+        // 严格按原生播放器需要的片段大小拉取，绝不全量提前下载
+        if let dataRequest = loadingRequest.dataRequest {
+            let offset = dataRequest.requestedOffset
+            let length = dataRequest.requestedLength
+            if length > 0 {
+                request.setValue("bytes=\(offset)-\(offset + Int64(length) - 1)", forHTTPHeaderField: "Range")
+            } else {
+                request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+            }
+        }
+        
+        let task = session.dataTask(with: request)
+        activeTasks[task] = loadingRequest
+        task.resume()
+        return true
     }
     
-    private func handleConnection(_ conn: NWConnection) {
-        conn.start(queue: queue)
-        conn.receive(minimumIncompleteLength: 4, maximumLength: 4096) { [weak self] data, _, _, _ in
-            guard let self = self, let data = data, let reqStr = String(data: data, encoding: .utf8) else {
-                conn.cancel()
-                return
-            }
-            
-            let lines = reqStr.components(separatedBy: "\r\n")
-            guard let firstLine = lines.first, firstLine.hasPrefix("GET ") else {
-                conn.cancel()
-                return
-            }
-            
-            let path = firstLine.split(separator: " ")[1]
-            let parts = path.split(separator: "/")
-            guard let key = parts.first else {
-                conn.cancel()
-                return
-            }
-            
-            guard let targetURL = self.urlMapping[String(key)] else {
-                conn.cancel()
-                return
-            }
-            
-            var remoteReq = URLRequest(url: targetURL)
-            remoteReq.setValue("https://www.bilibili.com", forHTTPHeaderField: "Referer")
-            remoteReq.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
-            
-            let cookie = CookieManager.shared.cookieHeader
-            if !cookie.isEmpty {
-                remoteReq.setValue(cookie, forHTTPHeaderField: "Cookie")
-            }
-            
-            // 透传 Range 请求头（确保拖拽进度条能正常工作）
-            for line in lines {
-                if line.lowercased().hasPrefix("range:") {
-                    let val = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
-                    remoteReq.setValue(val, forHTTPHeaderField: "Range")
-                }
-            }
-            
-            let task = URLSession.shared.dataTask(with: remoteReq) { rData, rResp, _ in
-                guard let httpResp = rResp as? HTTPURLResponse else {
-                    conn.cancel()
-                    return
-                }
-                
-                var headerStr = "HTTP/1.1 \(httpResp.statusCode) OK\r\n"
-                for (k, v) in httpResp.allHeaderFields {
-                    let kStr = "\(k)"
-                    if kStr.lowercased() != "connection" && kStr.lowercased() != "transfer-encoding" {
-                        headerStr += "\(k): \(v)\r\n"
-                    }
-                }
-                headerStr += "Content-Type: video/mp4\r\n"
-                headerStr += "Connection: close\r\n\r\n"
-                
-                var responseData = headerStr.data(using: .utf8) ?? Data()
-                if let rData = rData {
-                    responseData.append(rData)
-                }
-                
-                conn.send(content: responseData, completion: .contentProcessed({ _ in
-                    conn.cancel()
-                }))
-            }
-            task.resume()
+    func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
+        for (task, req) in activeTasks where req == loadingRequest {
+            task.cancel()
+            activeTasks.removeValue(forKey: task)
         }
+    }
+    
+    // MARK: - 🌟 逐包实时推送：首个 16KB 数据一收到，立刻喂给播放器解码！
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
+        guard let req = activeTasks[dataTask], let httpResponse = response as? HTTPURLResponse else {
+            completionHandler(.cancel)
+            return
+        }
+        
+        if let contentInfo = req.contentInformationRequest {
+            contentInfo.contentType = "public.mpeg-4"
+            contentInfo.isByteRangeAccessSupported = true
+            if let rangeHeader = httpResponse.allHeaderFields["Content-Range"] as? String ?? httpResponse.allHeaderFields["content-range"] as? String,
+               let totalStr = rangeHeader.split(separator: "/").last,
+               let total = Int64(totalStr.trimmingCharacters(in: .whitespaces)) {
+                contentInfo.contentLength = total
+            } else if httpResponse.expectedContentLength > 0 {
+                contentInfo.contentLength = httpResponse.expectedContentLength
+            }
+        }
+        completionHandler(.allow)
+    }
+    
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        guard let req = activeTasks[dataTask] else { return }
+        req.dataRequest?.respond(with: data) // 收到即推，秒开画面
+    }
+    
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let dataTask = task as? URLSessionDataTask, let req = activeTasks[dataTask] else { return }
+        if let error = error as NSError?, error.code != NSURLErrorCancelled {
+            req.finishLoading(with: error)
+        } else {
+            req.finishLoading()
+        }
+        activeTasks.removeValue(forKey: dataTask)
     }
 }
 
-// MARK: - 播放控制器核心管理器
+// MARK: - 播放管理器
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var currentQualityName: String = "1080P60"
@@ -133,6 +136,7 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
+        // 自动记忆音量
         videoPlayer.publisher(for: \.volume)
             .sink { [weak self] vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
@@ -188,35 +192,28 @@ final class VideoPlayerManager: ObservableObject {
                 self.selectedQualityId = activeQn
                 self.currentQualityName = list.first(where: { $0.0 == activeQn })?.1 ?? "\(activeQn)P"
                 
-                if let durl = playInfo.durl?.first, let streamUrl = URL(string: durl.url) {
-                    let proxied = BiliLocalProxy.shared.proxyURL(for: streamUrl)
-                    let item = AVPlayerItem(url: proxied)
-                    self.videoPlayer.replaceCurrentItem(with: item)
-                    self.audioPlayer = nil
-                } else if let dash = playInfo.dash {
-                    let candidates = dash.video.filter { $0.id == activeQn }
-                    
-                    // Intel 核显硬解锁定 AVC/H.264
-                    let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
-                        ?? candidates.first(where: { ($0.codecs ?? "").lowercased().contains("hev") })
-                        ?? candidates.first(where: { !($0.codecs ?? "").lowercased().contains("av01") })
-                        ?? dash.video.first!
-                    
-                    guard let vUrl = URL(string: vStream.baseUrl) else { return }
-                    
-                    // 🌟 本地代理直接喂入标准 .mp4 格式，画面立即呈现
-                    let proxiedVUrl = BiliLocalProxy.shared.proxyURL(for: vUrl, isAudio: false)
-                    let vItem = AVPlayerItem(url: proxiedVUrl)
-                    self.videoPlayer.replaceCurrentItem(with: vItem)
-                    
-                    // 音频轨
-                    if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
-                        let proxiedAUrl = BiliLocalProxy.shared.proxyURL(for: aUrl, isAudio: true)
-                        let aItem = AVPlayerItem(url: proxiedAUrl)
-                        let aPlayer = AVPlayer(playerItem: aItem)
-                        aPlayer.volume = self.videoPlayer.volume
-                        self.audioPlayer = aPlayer
-                    }
+                guard let dash = playInfo.dash else { return }
+                
+                let candidates = dash.video.filter { $0.id == activeQn }
+                
+                // 排除 AV1，锁定 Intel i5 核显硬解的 AVC/H.264
+                let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().hasPrefix("avc") })
+                    ?? candidates.first(where: { ($0.codecs ?? "").lowercased().hasPrefix("hev") })
+                    ?? candidates.first(where: { !($0.codecs ?? "").lowercased().hasPrefix("av01") })
+                    ?? dash.video.first!
+                
+                guard let vUrl = URL(string: vStream.baseUrl) else { return }
+                let vAsset = BiliStreamLoader.shared.createAsset(from: vUrl, isAudio: false)
+                let vItem = AVPlayerItem(asset: vAsset)
+                self.videoPlayer.replaceCurrentItem(with: vItem)
+                
+                // 音频轨
+                if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
+                    let aAsset = BiliStreamLoader.shared.createAsset(from: aUrl, isAudio: true)
+                    let aItem = AVPlayerItem(asset: aAsset)
+                    let aPlayer = AVPlayer(playerItem: aItem)
+                    aPlayer.volume = self.videoPlayer.volume
+                    self.audioPlayer = aPlayer
                 }
                 
                 if resumeTime > 0 {
@@ -236,12 +233,14 @@ final class VideoPlayerManager: ObservableObject {
         }
     }
     
+    // 🌟 全量熔断方法：停止播放、清空内存、断开一切 TCP 网络连接
     func cleanup() {
         videoPlayer.pause()
         audioPlayer?.pause()
         videoPlayer.replaceCurrentItem(with: nil)
         audioPlayer?.replaceCurrentItem(with: nil)
         audioPlayer = nil
+        BiliStreamLoader.shared.cancelAll() // 掐断后台流
         isPlaying = false
     }
     
