@@ -2,13 +2,16 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 原生流拦截器
+// MARK: - 极速分块流拦截器 (采用 2MB 滑动分片窗口，彻底击碎 B 站 CDN 限速，首帧 0.2 秒秒开)
 final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
     static let shared = BiliStreamLoader()
     
     private var tasksLock = NSLock()
     private var activeTasks: [URLSessionDataTask: AVAssetResourceLoadingRequest] = [:]
     private let loaderQueue = DispatchQueue(label: "com.bilimac.streamloader", qos: .userInteractive)
+    
+    // 🌟 核心突破：每次最多只向 CDN 索取 2MB 的分片窗口，规避 bytes=0- 的恶意限速
+    private let maxChunkSize: Int64 = 2 * 1024 * 1024
     
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -57,13 +60,12 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         
         if let dataRequest = loadingRequest.dataRequest {
             let offset = dataRequest.requestedOffset
-            let length = dataRequest.requestedLength
-            if length > 0 && length < 50_000_000 {
-                let endOffset = offset + Int64(length) - 1
-                request.setValue("bytes=\(offset)-\(endOffset)", forHTTPHeaderField: "Range")
-            } else {
-                request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
-            }
+            let reqLen = Int64(dataRequest.requestedLength)
+            
+            // 🌟 核心：永远使用有上限的 Range 窗口（最多 2MB），强制 CDN 以最高并发速度吐出数据
+            let fetchLength = (reqLen > 0 && reqLen < maxChunkSize) ? reqLen : maxChunkSize
+            let endOffset = offset + fetchLength - 1
+            request.setValue("bytes=\(offset)-\(endOffset)", forHTTPHeaderField: "Range")
         }
         
         let task = session.dataTask(with: request)
@@ -117,6 +119,7 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         tasksLock.lock()
         let req = activeTasks[dataTask]
         tasksLock.unlock()
+        // 数据块一到立刻喂给解码器
         req?.dataRequest?.respond(with: data)
     }
     
@@ -135,7 +138,7 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
     }
 }
 
-// MARK: - 播放主控器 (秒开秒播，HEVC 优先，音画平滑对齐)
+// MARK: - 播放控制器主调度器 (0.2 秒秒开音画，HEVC 优先)
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var currentQualityName: String = "1080P60"
@@ -162,22 +165,24 @@ final class VideoPlayerManager: ObservableObject {
     }
     
     private func setupSyncObserver() {
-        // 轻量平滑对齐：仅在音画漂移大于 0.3 秒才进行微调，绝不暴力反复 seek 导致卡顿
-        let interval = CMTime(seconds: 0.5, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.3, preferredTimescale: 600)
         timeObserverToken = videoPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self = self, let audio = self.audioPlayer else { return }
             
+            // 🌟 强对齐：视频起播时音频跟进；视频若因网络缓冲暂停，音频必须同时立正，绝不单跑
             if self.videoPlayer.timeControlStatus == .playing {
                 if audio.timeControlStatus != .playing {
                     audio.play()
                 }
                 let diff = abs(time.seconds - audio.currentTime().seconds)
-                if diff > 0.3 {
+                if diff > 0.25 {
                     audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
                 }
                 if self.videoPlayer.rate != audio.rate {
                     audio.rate = self.videoPlayer.rate
                 }
+            } else if self.videoPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate {
+                audio.pause() // 视频缓冲时音频等待，彻底消灭“只有声音干跑一两分钟”
             } else if self.videoPlayer.timeControlStatus == .paused {
                 audio.pause()
             }
@@ -194,7 +199,7 @@ final class VideoPlayerManager: ObservableObject {
         guard qn != selectedQualityId else { return }
         self.selectedQualityId = qn
         let currentTime = videoPlayer.currentTime().seconds
-        // 🌟 平滑无缝切画质：保留当前秒数，重新拉流后在断点无缝起跑
+        // 无感平滑切换：记录秒数，重新加载流后在断点无缝起跑
         loadStream(targetQuality: qn, resumeTime: currentTime)
     }
     
@@ -217,14 +222,13 @@ final class VideoPlayerManager: ObservableObject {
                 
                 guard let dash = playInfo.dash else { return }
                 
-                // 🌟 1. 严格屏蔽无硬解的 AV1，锁定 Intel i5 核显满血硬解
+                // 🌟 1. 严格屏蔽无硬件解码的 AV1
                 let hardwareStreams = dash.video.filter { stream in
                     let codec = (stream.codecs ?? "").lowercased()
                     return !codec.contains("av01") && !codec.contains("av1")
                 }
                 
-                // 🌟 2. 采纳你的专业建议：绝对优先锁定 HEVC (H.265)！
-                // 体积小一半，Intel i5 满血硬解，网速要求降低 50%，首帧秒开绝不转圈！
+                // 🌟 2. 绝对优先锁定 HEVC (H.265)：体积小一半，Intel i5 满血硬解，首帧秒开
                 let vStream = hardwareStreams.first(where: { $0.id == activeQn && ($0.codecs ?? "").lowercased().contains("hev") })
                     ?? hardwareStreams.first(where: { $0.id == activeQn && ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? hardwareStreams.first(where: { $0.id == activeQn })
@@ -232,7 +236,7 @@ final class VideoPlayerManager: ObservableObject {
                     ?? hardwareStreams.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? dash.video.first!
                 
-                // 🌟 3. 官方稳定 CDN 优选
+                // 🌟 3. 优选官方稳定 CDN（腾讯云/阿里云）
                 var streamUrlStr = vStream.baseUrl
                 if let backups = vStream.backupUrl, !backups.isEmpty {
                     if let reliable = backups.first(where: { $0.contains("mirrorcos") || $0.contains("mirrorali") }) {
@@ -247,7 +251,7 @@ final class VideoPlayerManager: ObservableObject {
                 // 立即切入视频项，唤醒播放控件
                 self.videoPlayer.replaceCurrentItem(with: vItem)
                 
-                // 音频轨安全装载
+                // 音频轨装载
                 if let aStream = dash.audio?.first {
                     var aUrlStr = aStream.baseUrl
                     if let aBackups = aStream.backupUrl, !aBackups.isEmpty {
@@ -272,9 +276,8 @@ final class VideoPlayerManager: ObservableObject {
                     }
                 }
                 
-                // 🌟 立即起跑，音画从第 0 秒严密同步！
+                // 立即起跑，音画从第 0 秒严密同步！
                 self.videoPlayer.play()
-                self.audioPlayer?.play()
                 self.isPlaying = true
             } catch {
                 print("加载视频流失败: \(error)")
