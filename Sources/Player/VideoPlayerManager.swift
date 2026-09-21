@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 原生流拦截器 (精准分片传输，杜绝提前截断导致视频过早结束)
+// MARK: - 原生流拦截器
 final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
     static let shared = BiliStreamLoader()
     
@@ -55,7 +55,6 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
         
-        // 🌟 核心修复：精准提供系统播放器所需的分片长度，绝不人为提前截断
         if let dataRequest = loadingRequest.dataRequest {
             let offset = dataRequest.requestedOffset
             let reqLen = Int64(dataRequest.requestedLength)
@@ -137,12 +136,13 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
     }
 }
 
-// MARK: - 播放控制器主调度器 (解锁 4K/1080P60 切换，音画毫秒级同频)
+// MARK: - 播放控制器主调度器 (真 4K HEVC 锁定与真实分辨率监测)
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
-    @Published var currentQualityName: String = "1080P60"
+    @Published var currentQualityName: String = "4K"
+    @Published var currentResolutionBadge: String = "" // 🌟 实时展示物理分辨率 (如 HEVC 3840x2160)
     @Published var availableQualities: [(id: Int, name: String)] = []
-    @Published var selectedQualityId: Int = 116
+    @Published var selectedQualityId: Int = 120 // 默认优先请求最高 4K
     @Published var volume: Float = 0.8 {
         didSet {
             UserDefaults.standard.set(volume, forKey: "bili_saved_volume")
@@ -195,7 +195,6 @@ final class VideoPlayerManager: ObservableObject {
         guard qn != selectedQualityId else { return }
         self.selectedQualityId = qn
         let currentTime = videoPlayer.currentTime().seconds
-        // 🌟 真实触发清晰度重载，并在当前秒数无缝起跑
         loadStream(targetQuality: qn, resumeTime: currentTime)
     }
     
@@ -214,31 +213,37 @@ final class VideoPlayerManager: ObservableObject {
                 
                 guard let dash = playInfo.dash else { return }
                 
-                // 🌟 核心修复：尊重用户选择的清晰度！
-                // 如果用户选择了 4K(120) 或 1080P60(116)，且该视频提供，绝不强退回 1080P 普通
-                let actualQn: Int
+                // 🌟 1. 严格检查 targetQuality 是否存在
+                let targetQn: Int
                 if dash.video.contains(where: { $0.id == targetQuality }) {
-                    actualQn = targetQuality
+                    targetQn = targetQuality
                 } else {
-                    actualQn = list.first?.0 ?? playInfo.quality
+                    targetQn = list.first?.0 ?? playInfo.quality
                 }
                 
-                self.selectedQualityId = actualQn
-                self.currentQualityName = list.first(where: { $0.0 == actualQn })?.1 ?? "\(actualQn)P"
-                
-                // 排除 AV1，锁定 Intel i5 核显硬解
+                // 🌟 2. 锁定 Intel i5 核显完全硬解流 (HEVC / AVC)
                 let hardwareStreams = dash.video.filter { stream in
                     let codec = (stream.codecs ?? "").lowercased()
                     return !codec.contains("av01") && !codec.contains("av1")
                 }
                 
-                // 🌟 按照 actualQn 精准提取 HEVC 或 AVC
-                let vStream = hardwareStreams.first(where: { $0.id == actualQn && ($0.codecs ?? "").lowercased().contains("hev") })
-                    ?? hardwareStreams.first(where: { $0.id == actualQn && ($0.codecs ?? "").lowercased().contains("avc") })
-                    ?? hardwareStreams.first(where: { $0.id == actualQn })
+                // 🌟 3. 精准匹配 targetQn 的 HEVC 4K 流！
+                let vStream = hardwareStreams.first(where: { $0.id == targetQn && ($0.codecs ?? "").lowercased().contains("hev") })
+                    ?? hardwareStreams.first(where: { $0.id == targetQn && ($0.codecs ?? "").lowercased().contains("avc") })
+                    ?? hardwareStreams.first(where: { $0.id == targetQn })
                     ?? hardwareStreams.first(where: { ($0.codecs ?? "").lowercased().contains("hev") })
                     ?? hardwareStreams.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? dash.video.first!
+                
+                // 真实画质标签绑定（绝不虚报，所播即所显）
+                let realQn = vStream.id
+                self.selectedQualityId = realQn
+                let qName = list.first(where: { $0.0 == realQn })?.1 ?? "\(realQn)P"
+                let codecTag = (vStream.codecs ?? "").lowercased().contains("hev") ? "HEVC" : "AVC"
+                let dimension = (vStream.width != nil && vStream.height != nil) ? "\(vStream.width!)x\(vStream.height!)" : ""
+                
+                self.currentQualityName = qName
+                self.currentResolutionBadge = "\(codecTag) \(dimension)"
                 
                 // 优选官方稳定 CDN 节点
                 var streamUrlStr = vStream.baseUrl
@@ -252,10 +257,9 @@ final class VideoPlayerManager: ObservableObject {
                 let vAsset = BiliStreamLoader.shared.createAsset(from: finalVUrl, isAudio: false)
                 let vItem = AVPlayerItem(asset: vAsset)
                 
-                // 立即更新视频播放项
                 self.videoPlayer.replaceCurrentItem(with: vItem)
                 
-                // 装载音频轨
+                // 装载音频
                 if let aStream = dash.audio?.first {
                     var aUrlStr = aStream.baseUrl
                     if let aBackups = aStream.backupUrl, !aBackups.isEmpty {
@@ -280,7 +284,6 @@ final class VideoPlayerManager: ObservableObject {
                     }
                 }
                 
-                // 🌟 音画同频同时起跑，彻底消除声音延迟！
                 self.videoPlayer.play()
                 self.audioPlayer?.play()
                 self.isPlaying = true
