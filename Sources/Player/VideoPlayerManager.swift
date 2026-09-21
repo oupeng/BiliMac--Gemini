@@ -2,12 +2,13 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 真实流式数据拦截器 (逐包实时喂给硬件解码器，毫秒级起播，支持退出物理熔断)
+// MARK: - B 站原生流媒体拦截器 (解决防盗链、零延迟推流、强力断网熔断)
 final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
     static let shared = BiliStreamLoader()
     
-    private var activeTasks = [URLSessionDataTask: AVAssetResourceLoadingRequest]()
-    private let queue = DispatchQueue(label: "com.bilimac.streamloader", qos: .userInteractive)
+    private var tasksLock = NSLock()
+    private var activeTasks: [URLSessionDataTask: AVAssetResourceLoadingRequest] = [:]
+    private let loaderQueue = DispatchQueue(label: "com.bilimac.streamloader", qos: .userInteractive)
     
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
@@ -23,22 +24,21 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         
         guard let customURL = comp.url else { return AVURLAsset(url: url) }
         let asset = AVURLAsset(url: customURL)
-        asset.resourceLoader.setDelegate(self, queue: queue)
+        asset.resourceLoader.setDelegate(self, queue: loaderQueue)
         return asset
     }
     
-    // 🌟 物理断网熔断：退出时立即掐死所有网络请求，流量瞬间归零
+    // 🌟 强力物理断流：瞬间取消所有进行中的网络任务，流量立刻归零
     func cancelAll() {
-        queue.async {
-            for (task, req) in self.activeTasks {
-                task.cancel()
-                req.finishLoading()
-            }
-            self.activeTasks.removeAll()
+        tasksLock.lock()
+        for (task, req) in activeTasks {
+            task.cancel()
+            req.finishLoading()
         }
+        activeTasks.removeAll()
+        tasksLock.unlock()
     }
     
-    // MARK: - 拦截 Range 分片请求
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest) -> Bool {
         guard let customURL = loadingRequest.request.url,
               let comp = URLComponents(url: customURL, resolvingAgainstBaseURL: false),
@@ -49,14 +49,14 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         
         var request = URLRequest(url: realURL)
         request.setValue("https://www.bilibili.com", forHTTPHeaderField: "Referer")
-        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         
         let cookie = CookieManager.shared.cookieHeader
         if !cookie.isEmpty {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
         
-        // 严格按原生播放器需要的片段大小拉取，绝不全量提前下载
+        // 关键：精准透传分片 Range
         if let dataRequest = loadingRequest.dataRequest {
             let offset = dataRequest.requestedOffset
             let length = dataRequest.requestedLength
@@ -68,26 +68,34 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         }
         
         let task = session.dataTask(with: request)
+        tasksLock.lock()
         activeTasks[task] = loadingRequest
+        tasksLock.unlock()
         task.resume()
         return true
     }
     
     func resourceLoader(_ resourceLoader: AVAssetResourceLoader, didCancel loadingRequest: AVAssetResourceLoadingRequest) {
+        tasksLock.lock()
         for (task, req) in activeTasks where req == loadingRequest {
             task.cancel()
             activeTasks.removeValue(forKey: task)
         }
+        tasksLock.unlock()
     }
     
-    // MARK: - 🌟 逐包实时推送：首个 16KB 数据一收到，立刻喂给播放器解码！
+    // MARK: - URLSessionDataDelegate 逐包实时响应
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        guard let req = activeTasks[dataTask], let httpResponse = response as? HTTPURLResponse else {
+        tasksLock.lock()
+        let req = activeTasks[dataTask]
+        tasksLock.unlock()
+        
+        guard let loadingRequest = req, let httpResponse = response as? HTTPURLResponse else {
             completionHandler(.cancel)
             return
         }
         
-        if let contentInfo = req.contentInformationRequest {
+        if let contentInfo = loadingRequest.contentInformationRequest {
             contentInfo.contentType = "public.mpeg-4"
             contentInfo.isByteRangeAccessSupported = true
             if let rangeHeader = httpResponse.allHeaderFields["Content-Range"] as? String ?? httpResponse.allHeaderFields["content-range"] as? String,
@@ -102,22 +110,30 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
     }
     
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let req = activeTasks[dataTask] else { return }
-        req.dataRequest?.respond(with: data) // 收到即推，秒开画面
+        tasksLock.lock()
+        let req = activeTasks[dataTask]
+        tasksLock.unlock()
+        
+        // 逐包喂入硬件解码器，画面瞬间呈现
+        req?.dataRequest?.respond(with: data)
     }
     
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let dataTask = task as? URLSessionDataTask, let req = activeTasks[dataTask] else { return }
+        guard let dTask = task as? URLSessionDataTask else { return }
+        tasksLock.lock()
+        let req = activeTasks[dTask]
+        activeTasks.removeValue(forKey: dTask)
+        tasksLock.unlock()
+        
         if let error = error as NSError?, error.code != NSURLErrorCancelled {
-            req.finishLoading(with: error)
+            req?.finishLoading(with: error)
         } else {
-            req.finishLoading()
+            req?.finishLoading()
         }
-        activeTasks.removeValue(forKey: dataTask)
     }
 }
 
-// MARK: - 播放管理器
+// MARK: - 播放控制器管理器
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var currentQualityName: String = "1080P60"
@@ -136,7 +152,7 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
-        // 自动记忆音量
+        // 音量记忆
         videoPlayer.publisher(for: \.volume)
             .sink { [weak self] vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
@@ -193,10 +209,9 @@ final class VideoPlayerManager: ObservableObject {
                 self.currentQualityName = list.first(where: { $0.0 == activeQn })?.1 ?? "\(activeQn)P"
                 
                 guard let dash = playInfo.dash else { return }
-                
                 let candidates = dash.video.filter { $0.id == activeQn }
                 
-                // 排除 AV1，锁定 Intel i5 核显硬解的 AVC/H.264
+                // 排除 AV1，优先 AVC (H.264)，确保 Intel i5 满血硬解
                 let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().hasPrefix("avc") })
                     ?? candidates.first(where: { ($0.codecs ?? "").lowercased().hasPrefix("hev") })
                     ?? candidates.first(where: { !($0.codecs ?? "").lowercased().hasPrefix("av01") })
@@ -207,7 +222,7 @@ final class VideoPlayerManager: ObservableObject {
                 let vItem = AVPlayerItem(asset: vAsset)
                 self.videoPlayer.replaceCurrentItem(with: vItem)
                 
-                // 音频轨
+                // 挂载音频轨
                 if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
                     let aAsset = BiliStreamLoader.shared.createAsset(from: aUrl, isAudio: true)
                     let aItem = AVPlayerItem(asset: aAsset)
@@ -228,19 +243,19 @@ final class VideoPlayerManager: ObservableObject {
                 self.audioPlayer?.play()
                 self.isPlaying = true
             } catch {
-                print("加载流媒体失败: \(error)")
+                print("加载视频流失败: \(error)")
             }
         }
     }
     
-    // 🌟 全量熔断方法：停止播放、清空内存、断开一切 TCP 网络连接
+    // 🌟 全量熔断方法：退出时掐死一切流媒体与网络请求
     func cleanup() {
         videoPlayer.pause()
         audioPlayer?.pause()
         videoPlayer.replaceCurrentItem(with: nil)
         audioPlayer?.replaceCurrentItem(with: nil)
         audioPlayer = nil
-        BiliStreamLoader.shared.cancelAll() // 掐断后台流
+        BiliStreamLoader.shared.cancelAll()
         isPlaying = false
     }
     
