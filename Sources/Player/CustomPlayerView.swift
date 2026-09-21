@@ -1,15 +1,22 @@
 import SwiftUI
 import AVKit
 
-struct AVPlayerNSViewWrapper: NSViewRepresentable {
+// MARK: - 接入 macOS 原生原生系统级播放器 (图 2 样式)
+struct NativePlayerViewRepresentable: NSViewRepresentable {
     let player: AVPlayer
     
     func makeNSView(context: Context) -> AVPlayerView {
-        let view = AVPlayerView()
-        view.player = player
-        view.controlsStyle = .none // 自绘 SwiftUI 控制栏
-        view.videoGravity = .resizeAspect
-        return view
+        let playerView = AVPlayerView()
+        playerView.player = player
+        
+        // 🌟 启用图 2 同款的 macOS 系统原生毛玻璃浮动控制栏
+        playerView.controlsStyle = .floating
+        playerView.showsFrameSteppingButtons = false
+        playerView.showsSharingServicePicker = false
+        playerView.showsFullScreenToggleButton = true
+        playerView.videoGravity = .resizeAspect
+        
+        return playerView
     }
     
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
@@ -21,95 +28,45 @@ struct AVPlayerNSViewWrapper: NSViewRepresentable {
 
 struct CustomPlayerView: View {
     @ObservedObject var playerManager: VideoPlayerManager
-    @State private var isHovering = false
     
     var body: some View {
-        ZStack {
-            AVPlayerNSViewWrapper(player: playerManager.videoPlayer)
-                .onTapGesture {
-                    playerManager.togglePlay()
-                }
+        ZStack(alignment: .topTrailing) {
+            // 原生播放视图 (内置原生进度条、原生音量滑块、原生暂停播放和快进)
+            NativePlayerViewRepresentable(player: playerManager.videoPlayer)
             
-            // 悬浮自制控制栏
-            VStack {
-                Spacer()
-                if isHovering || !playerManager.isPlaying {
-                    VStack(spacing: 8) {
-                        // 进度条
-                        Slider(
-                            value: Binding(
-                                get: { playerManager.currentTime },
-                                set: { playerManager.seek(to: $0) }
-                            ),
-                            in: 0...max(playerManager.duration, 1)
-                        )
-                        .accentColor(.pink)
-                        
-                        HStack(spacing: 12) {
-                            Button(action: { playerManager.togglePlay() }) {
-                                Image(systemName: playerManager.isPlaying ? "pause.fill" : "play.fill")
-                                    .font(.title2)
-                            }
-                            .buttonStyle(.plain)
-                            
-                            Text("\(formatTime(playerManager.currentTime)) / \(formatTime(playerManager.duration))")
-                                .font(.caption.monospacedDigit())
-                            
-                            Spacer()
-                            
-                            // 清晰度切换下拉菜单
-                            Menu {
-                                ForEach(playerManager.availableQualities, id: \.id) { q in
-                                    Button(action: { playerManager.changeQuality(to: q.id) }) {
-                                        HStack {
-                                            Text(q.name)
-                                            if q.id == playerManager.selectedQualityId {
-                                                Image(systemName: "checkmark")
-                                            }
-                                        }
-                                    }
+            // 右上角浮层：当前清晰度与切换菜单
+            if !playerManager.availableQualities.isEmpty {
+                Menu {
+                    ForEach(playerManager.availableQualities, id: \.id) { q in
+                        Button(action: {
+                            playerManager.changeQuality(to: q.id)
+                        }) {
+                            HStack {
+                                Text(q.name)
+                                if q.id == playerManager.selectedQualityId {
+                                    Image(systemName: "checkmark")
                                 }
-                            } label: {
-                                Text(playerManager.currentQualityName)
-                                    .font(.caption.bold())
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Color.secondary.opacity(0.3))
-                                    .cornerRadius(6)
                             }
-                            .menuStyle(.borderlessButton)
-                            
-                            // 音量调节 (自动记住)
-                            HStack(spacing: 4) {
-                                Image(systemName: playerManager.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                                Slider(value: $playerManager.volume, in: 0...1)
-                                    .frame(width: 70)
-                                    .accentColor(.pink)
-                            }
-                            
-                            // 全屏切换
-                            Button(action: {
-                                NSApplication.shared.keyWindow?.toggleFullScreen(nil)
-                            }) {
-                                Image(systemName: "arrow.up.left.and.arrow.down.right")
-                            }
-                            .buttonStyle(.plain)
                         }
                     }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
-                    .background(Color.black.opacity(0.75))
-                    .transition(.opacity)
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(playerManager.currentQualityName)
+                            .font(.system(size: 11, weight: .semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(.ultraThinMaterial)
+                    .cornerRadius(6)
+                    .shadow(radius: 2)
                 }
+                .menuStyle(.borderlessButton)
+                .padding(.top, 12)
+                .padding(.trailing, 12)
             }
         }
-        .onHover { isHovering = $0 }
-    }
-    
-    private func formatTime(_ sec: Double) -> String {
-        guard !sec.isNaN && sec >= 0 else { return "00:00" }
-        let m = Int(sec) / 60
-        let s = Int(sec) % 60
-        return String(format: "%02d:%02d", m, s)
     }
 }
