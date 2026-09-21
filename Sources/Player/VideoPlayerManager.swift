@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 原生防盗链与数据流注入拦截器 (彻底解决 403 与 m4s 播放失败)
+// MARK: - 原生防盗链与流切片拦截器
 final class BiliResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     static let shared = BiliResourceLoader()
     private var tasks: [AVAssetResourceLoadingRequest: URLSessionDataTask] = [:]
@@ -14,10 +14,10 @@ final class BiliResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
         return URLSession(configuration: config)
     }()
     
-    func createAsset(from originalURL: URL) -> AVURLAsset {
+    func createAsset(from originalURL: URL, isAudio: Bool = false) -> AVURLAsset {
         var comp = URLComponents()
         comp.scheme = "bilistream"
-        comp.host = "video.mp4"
+        comp.host = isAudio ? "audio.mp4" : "video.mp4"
         comp.queryItems = [URLQueryItem(name: "real_url", value: originalURL.absoluteString)]
         
         guard let proxyURL = comp.url else {
@@ -102,14 +102,16 @@ final class BiliResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
     }
 }
 
-// MARK: - 播放控制管理器
+// MARK: - 播放控制器核心管理器
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
-    @Published var currentQualityName: String = "1080P"
+    @Published var currentQualityName: String = "加载中..."
     @Published var availableQualities: [(id: Int, name: String)] = []
-    @Published var selectedQualityId: Int = 80
+    @Published var selectedQualityId: Int = 116 // 优先尝试最高画质 1080P60
     
     let videoPlayer = AVPlayer()
+    private var audioPlayer: AVPlayer?
+    private var timeObserverToken: Any?
     private var currentBvid: String = ""
     private var currentCid: Int = 0
     private var cancellables = Set<AnyCancellable>()
@@ -119,12 +121,31 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
-        // 自动记忆并持久化调节的音量
+        // 自动记忆音量调节
         videoPlayer.publisher(for: \.volume)
-            .sink { vol in
+            .sink { [weak self] vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
+                self?.audioPlayer?.volume = vol
             }
             .store(in: &cancellables)
+            
+        setupSyncObserver()
+    }
+    
+    private func setupSyncObserver() {
+        // 双轨精准对齐时钟
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+        timeObserverToken = videoPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+            guard let self = self, let audio = self.audioPlayer else { return }
+            let vSec = time.seconds
+            let aSec = audio.currentTime().seconds
+            if abs(vSec - aSec) > 0.15 {
+                audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+            if self.videoPlayer.rate != audio.rate {
+                audio.rate = self.videoPlayer.rate
+            }
+        }
     }
     
     func playVideo(bvid: String, cid: Int) {
@@ -157,40 +178,51 @@ final class VideoPlayerManager: ObservableObject {
                 self.selectedQualityId = activeQn
                 self.currentQualityName = list.first(where: { $0.0 == activeQn })?.1 ?? "\(activeQn)P"
                 
-                // 挑选流媒体地址（优先标准 MP4 单流，其次 DASH 流）
-                var streamUrlString: String? = nil
-                if let durl = playInfo.durl?.first {
-                    streamUrlString = durl.url
-                } else if let dash = playInfo.dash {
-                    let candidates = dash.video.filter { $0.id == activeQn }
-                    let vStream = candidates.first(where: { ($0.codecs ?? "").contains("avc") })
-                        ?? candidates.first(where: { ($0.codecs ?? "").contains("hev") })
-                        ?? candidates.first
-                        ?? dash.video.first!
-                    streamUrlString = vStream.baseUrl
+                guard let dash = playInfo.dash else { return }
+                
+                let candidates = dash.video.filter { $0.id == activeQn }
+                
+                // 🌟 彻底排除 AV1！强制锁定 Intel i5 核显完全硬解的 AVC/H.264，极大降低 CPU 负载与发热
+                let vStream = candidates.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
+                    ?? candidates.first(where: { ($0.codecs ?? "").lowercased().contains("hev") })
+                    ?? candidates.first(where: { !($0.codecs ?? "").lowercased().contains("av01") })
+                    ?? dash.video.first!
+                
+                guard let vUrl = URL(string: vStream.baseUrl) else { return }
+                let vAsset = BiliResourceLoader.shared.createAsset(from: vUrl, isAudio: false)
+                let vItem = AVPlayerItem(asset: vAsset)
+                
+                self.videoPlayer.replaceCurrentItem(with: vItem)
+                
+                // 挂载音频轨（AAC/M4A）
+                if let aStream = dash.audio?.first, let aUrl = URL(string: aStream.baseUrl) {
+                    let aAsset = BiliResourceLoader.shared.createAsset(from: aUrl, isAudio: true)
+                    let aItem = AVPlayerItem(asset: aAsset)
+                    let aPlayer = AVPlayer(playerItem: aItem)
+                    aPlayer.volume = self.videoPlayer.volume
+                    self.audioPlayer = aPlayer
                 }
-                
-                guard let finalStr = streamUrlString, let targetUrl = URL(string: finalStr) else { return }
-                
-                // 🌟 通过原生资源拦截器构建资产，彻底消除防盗链拦截
-                let asset = BiliResourceLoader.shared.createAsset(from: targetUrl)
-                let item = AVPlayerItem(asset: asset)
-                
-                self.videoPlayer.replaceCurrentItem(with: item)
-                
-                let savedVol = UserDefaults.standard.float(forKey: "bili_saved_volume")
-                self.videoPlayer.volume = savedVol == 0 ? 0.8 : savedVol
                 
                 if resumeTime > 0 {
                     let targetCM = CMTime(seconds: resumeTime, preferredTimescale: 600)
                     await self.videoPlayer.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                    if let audio = self.audioPlayer {
+                        await audio.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
+                    }
                 }
                 
                 self.videoPlayer.play()
+                self.audioPlayer?.play()
                 self.isPlaying = true
             } catch {
                 print("加载视频流失败: \(error)")
             }
+        }
+    }
+    
+    deinit {
+        if let token = timeObserverToken {
+            videoPlayer.removeTimeObserver(token)
         }
     }
 }
