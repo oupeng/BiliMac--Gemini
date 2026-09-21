@@ -67,6 +67,9 @@ struct DashStream: Codable {
     let backupUrl: [String]?
     let bandwidth: Int?
     let codecs: String?
+    let width: Int?
+    let height: Int?
+    let frameRate: String?
 }
 
 struct DurlData: Codable {
