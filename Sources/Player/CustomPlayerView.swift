@@ -1,16 +1,18 @@
 import SwiftUI
 import AVKit
 
-// MARK: - AppKit 纯原生播放器桥接 (彻底杜绝 _AVKit_SwiftUI 泛型元数据崩溃)
+// MARK: - 接入 macOS 原生系统级毛玻璃悬浮播放器 (图 2 截图同款控件)
 struct NativePlayerViewWrapper: NSViewRepresentable {
     let player: AVPlayer
     
     func makeNSView(context: Context) -> AVPlayerView {
         let playerView = AVPlayerView()
         playerView.player = player
-        // 启用系统现代内置控件 (带进度条、全屏、画中画、快进快退)
-        playerView.controlsStyle = .inline
+        
+        // 🌟 启用截图同款的 macOS 原生毛玻璃半透明浮动面板 (带音量滑块、AirPlay、进度条)
+        playerView.controlsStyle = .floating
         playerView.showsFullScreenToggleButton = true
+        playerView.showsSharingServiceButton = false
         playerView.videoGravity = .resizeAspect
         return playerView
     }
