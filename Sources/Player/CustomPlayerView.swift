@@ -1,7 +1,7 @@
 import SwiftUI
 import AVKit
 
-// MARK: - 接入 macOS 原生原生系统级播放器 (图 2 样式)
+// MARK: - 接入 macOS 原生系统级播放器 (图 2 原生毛玻璃悬浮样式)
 struct NativePlayerViewRepresentable: NSViewRepresentable {
     let player: AVPlayer
     
@@ -9,10 +9,9 @@ struct NativePlayerViewRepresentable: NSViewRepresentable {
         let playerView = AVPlayerView()
         playerView.player = player
         
-        // 🌟 启用图 2 同款的 macOS 系统原生毛玻璃浮动控制栏
+        // 🌟 启用 macOS 系统原生半透明毛玻璃浮动控制栏 (图 2 同款)
         playerView.controlsStyle = .floating
         playerView.showsFrameSteppingButtons = false
-        playerView.showsSharingServicePicker = false
         playerView.showsFullScreenToggleButton = true
         playerView.videoGravity = .resizeAspect
         
