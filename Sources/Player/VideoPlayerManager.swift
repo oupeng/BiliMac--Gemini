@@ -135,7 +135,7 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
     }
 }
 
-// MARK: - 播放控制器单流核心管理器 (删除双播放器，改用 Composition 单流)
+// MARK: - 播放控制器主调度器 (AVMutableComposition 单流合成架构)
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var currentQualityName: String = "1080P60"
@@ -152,7 +152,7 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
-        // 自动记忆原生悬浮面板上的音量滑块调节
+        // 自动记忆原生浮动控制栏上的音量滑块变化
         videoPlayer.publisher(for: \.volume)
             .sink { vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
@@ -192,14 +192,13 @@ final class VideoPlayerManager: ObservableObject {
                 
                 guard let dash = playInfo.dash else { return }
                 
-                // 🌟 1. 严格屏蔽无法硬解的 AV1
+                // 🌟 1. 严格屏蔽无硬件解码的 AV1，锁定 Intel i5 核显完全硬解
                 let hardwareStreams = dash.video.filter { stream in
                     let codec = (stream.codecs ?? "").lowercased()
                     return !codec.contains("av01") && !codec.contains("av1")
                 }
                 
-                // 🌟 2. 核心优化：绝对优先锁定 HEVC (H.265)！
-                // 体积比 H.264 减半，Intel i5 核显满血硬解，网速要求降低 50%，首帧秒开不转圈！
+                // 🌟 2. 采纳建议：绝对优先锁定 HEVC (H.265)！体积减半，首帧秒开
                 let vStream = hardwareStreams.first(where: { $0.id == activeQn && ($0.codecs ?? "").lowercased().contains("hev") })
                     ?? hardwareStreams.first(where: { $0.id == activeQn && ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? hardwareStreams.first(where: { $0.id == activeQn })
@@ -218,13 +217,12 @@ final class VideoPlayerManager: ObservableObject {
                 guard let finalVUrl = URL(string: streamUrlStr) else { return }
                 let vAsset = BiliStreamLoader.shared.createAsset(from: finalVUrl, isAudio: false)
                 
-                // 音频轨处理
                 var aAsset: AVURLAsset? = nil
                 if let aStream = dash.audio?.first {
                     var aUrlStr = aStream.baseUrl
                     if let aBackups = aStream.backupUrl, !aBackups.isEmpty {
-                        if let aReliable = aBackups.first(where: { $0.contains("mirrorcos") || $0.contains("mirrorali") }) {
-                            aUrlStr = aReliable
+                        if let reliable = aBackups.first(where: { $0.contains("mirrorcos") || $0.contains("mirrorali") }) {
+                            aUrlStr = reliable
                         }
                     }
                     if let aUrl = URL(string: aUrlStr) {
@@ -232,25 +230,29 @@ final class VideoPlayerManager: ObservableObject {
                     }
                 }
                 
-                // 🌟 4. 采用 AVMutableComposition 原生合成单流 (消灭双播放器，彻底解决音画不同步与重叠)
+                // 🌟 4. BiliKit 同款：严谨的 AVMutableComposition 异步合成
                 let composition = AVMutableComposition()
                 let compVideoTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
                 let compAudioTrack = composition.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)
                 
+                // 关键点 A：等待资源就绪并载入视频轨道
                 let vTracks = try await vAsset.loadTracks(withMediaType: .video)
-                if let vTrack = vTracks.first {
-                    let vRange = try await vTrack.load(.timeRange)
-                    try compVideoTrack?.insertTimeRange(vRange, of: vTrack, at: .zero)
-                    
-                    if let aAsset = aAsset {
-                        let aTracks = try await aAsset.loadTracks(withMediaType: .audio)
-                        if let aTrack = aTracks.first {
-                            let aRange = try await aTrack.load(.timeRange)
-                            try compAudioTrack?.insertTimeRange(aRange, of: aTrack, at: .zero)
-                        }
+                guard let vTrack = vTracks.first else {
+                    throw NSError(domain: "BiliMac", code: -1, userInfo: [NSLocalizedDescriptionKey: "无法加载视频轨道"])
+                }
+                let vRange = try await vTrack.load(.timeRange)
+                try compVideoTrack?.insertTimeRange(vRange, of: vTrack, at: .zero)
+                
+                // 关键点 B：独立载入音频轨道并插入独立音频时间范围
+                if let aAsset = aAsset {
+                    let aTracks = try await aAsset.loadTracks(withMediaType: .audio)
+                    if let aTrack = aTracks.first {
+                        let aRange = try await aTrack.load(.timeRange)
+                        try compAudioTrack?.insertTimeRange(aRange, of: aTrack, at: .zero)
                     }
                 }
                 
+                // 关键点 C：生成复合单流播放项，激活所有原生面板组件（音量滑块、画中画）
                 let playerItem = AVPlayerItem(asset: composition)
                 self.videoPlayer.replaceCurrentItem(with: playerItem)
                 
@@ -262,11 +264,12 @@ final class VideoPlayerManager: ObservableObject {
                     await self.videoPlayer.seek(to: targetCM, toleranceBefore: .zero, toleranceAfter: .zero)
                 }
                 
-                // 唯一的硬件主从时钟，音画百分之百同频起步！
+                // 硬件级音画严格同步起播
                 self.videoPlayer.play()
                 self.isPlaying = true
+                
             } catch {
-                print("单流合成加载失败，降级播放: \(error)")
+                print("加载流媒体失败: \(error)")
             }
         }
     }
