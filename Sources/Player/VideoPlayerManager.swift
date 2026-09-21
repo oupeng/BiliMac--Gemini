@@ -88,13 +88,20 @@ final class VideoPlayerManager: ObservableObject {
                 
                 // 判断是 DASH 还是 单一 MP4
                 if let dash = playInfo.dash {
-                    // 挑选匹配的视频流
-                    let vStream = dash.video.first(where: { $0.id == activeQn }) ?? dash.video.first!
+                    let candidates = dash.video.filter { $0.id == activeQn }
+                    
+                    // 🌟 专为 Intel i5 优化的硬解挑选策略：
+                    // 优先选择 AVC (H.264) 或 HEVC，坚决避开导致 i5 CPU 满载软解发热的 AV1 (av01)
+                    let vStream = candidates.first(where: { ($0.codecs ?? "").contains("avc") })
+                        ?? candidates.first(where: { ($0.codecs ?? "").contains("hev") })
+                        ?? candidates.first
+                        ?? dash.video.first!
+                    
                     let vUrl = URL(string: vStream.baseUrl)!
                     let vAsset = AVURLAsset(url: vUrl, options: ["AVURLAssetHTTPHeaderFieldsKey": headers])
                     let vItem = AVPlayerItem(asset: vAsset)
                     self.videoPlayer.replaceCurrentItem(with: vItem)
-                    self.videoPlayer.isMuted = true // 画面流静音，由音频流出声
+                    self.videoPlayer.isMuted = true // 画面静音，由音频流发声
                     
                     // 绑定音频流
                     if let aStream = dash.audio?.first {
