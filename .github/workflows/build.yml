@@ -1,0 +1,40 @@
+name: Build macOS App
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Build Executable via SwiftPM
+        run: |
+          swift build -c release --arch arm64 --arch x86_64 || swift build -c release
+
+      - name: Package macOS .app Bundle
+        run: |
+          mkdir -p BiliMac.app/Contents/MacOS
+          mkdir -p BiliMac.app/Contents/Resources
+          
+          if [ -f .build/apple/Products/Release/BiliMac ]; then
+            cp .build/apple/Products/Release/BiliMac BiliMac.app/Contents/MacOS/
+          else
+            cp .build/release/BiliMac BiliMac.app/Contents/MacOS/
+          fi
+          
+          cp Info.plist BiliMac.app/Contents/Info.plist
+          
+          # 对 .app 进行本地自签名以兼容 macOS Gatekeeper
+          codesign --force --deep --sign - BiliMac.app
+          zip -r -y BiliMac-macOS.zip BiliMac.app
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliMac-macOS-App
+          path: BiliMac-macOS.zip
