@@ -39,7 +39,7 @@ struct VideoDetailView: View {
             
             // 详情主体左右分栏
             HSplitView {
-                // 左侧：播放器 + 信息 + 画质选择 + 原生音量滑块 + 相关推荐
+                // 左侧：播放器 + 信息 + 原生音量调节 + 相关推荐
                 VStack(spacing: 0) {
                     CustomPlayerView(playerManager: playerManager)
                         .aspectRatio(16/9, contentMode: .fit)
@@ -64,30 +64,16 @@ struct VideoDetailView: View {
                                 
                                 Spacer()
                                 
-                                // 🌟 右上角控制组：原生音量调节滑块 + 清晰度切换
-                                HStack(spacing: 12) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: playerManager.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Slider(value: $playerManager.volume, in: 0...1)
-                                            .frame(width: 80)
-                                            .accentColor(.pink)
-                                    }
-                                    
-                                    if !playerManager.availableQualities.isEmpty {
-                                        Picker("", selection: Binding(
-                                            get: { playerManager.selectedQualityId },
-                                            set: { playerManager.changeQuality(to: $0) }
-                                        )) {
-                                            ForEach(playerManager.availableQualities, id: \.id) { q in
-                                                Text(q.name).tag(q.id)
-                                            }
-                                        }
-                                        .pickerStyle(.menu)
-                                        .frame(width: 125)
-                                    }
+                                // 🌟 右侧控制区：音量调节滑块（自动记忆）
+                                HStack(spacing: 6) {
+                                    Image(systemName: playerManager.volume == 0 ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Slider(value: $playerManager.volume, in: 0...1)
+                                        .frame(width: 90)
+                                        .accentColor(.pink)
                                 }
+                                .padding(.top, 4)
                             }
                             
                             Text(detail?.desc ?? "")
