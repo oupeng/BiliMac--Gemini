@@ -1,4 +1,4 @@
-name: Build macOS App
+name: Build macOS App (Intel x86_64)
 
 on:
   push:
@@ -12,29 +12,28 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Build Executable via SwiftPM
+      - name: Build Intel x86_64 Binary
         run: |
-          swift build -c release --arch arm64 --arch x86_64 || swift build -c release
+          # 仅针对 Intel x86_64 架构编译，极速构建
+          swift build -c release --arch x86_64
 
-      - name: Package macOS .app Bundle
+      - name: Package Intel .app Bundle
         run: |
           mkdir -p BiliMac.app/Contents/MacOS
           mkdir -p BiliMac.app/Contents/Resources
           
-          if [ -f .build/apple/Products/Release/BiliMac ]; then
-            cp .build/apple/Products/Release/BiliMac BiliMac.app/Contents/MacOS/
-          else
-            cp .build/release/BiliMac BiliMac.app/Contents/MacOS/
-          fi
+          # 自动检索生成的 x86_64 可执行文件
+          TARGET_BIN=$(find .build -type f -name "BiliMac" -perm +111 ! -name "*.dSYM*" ! -path "*/Intermediates*/*" | head -n 1)
+          cp "$TARGET_BIN" BiliMac.app/Contents/MacOS/BiliMac
           
           cp Info.plist BiliMac.app/Contents/Info.plist
           
-          # 对 .app 进行本地自签名以兼容 macOS Gatekeeper
+          # 针对本地环境自签名
           codesign --force --deep --sign - BiliMac.app
-          zip -r -y BiliMac-macOS.zip BiliMac.app
+          zip -r -y BiliMac-Intel.zip BiliMac.app
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: BiliMac-macOS-App
-          path: BiliMac-macOS.zip
+          name: BiliMac-Intel
+          path: BiliMac-Intel.zip
