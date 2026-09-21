@@ -2,7 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 
-// MARK: - 原生流拦截器 (防盗链穿透、状态码校验、防 416 溢出)
+// MARK: - 原生流拦截器
 final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessionDataDelegate {
     static let shared = BiliStreamLoader()
     
@@ -58,7 +58,6 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
         if let dataRequest = loadingRequest.dataRequest {
             let offset = dataRequest.requestedOffset
             let length = dataRequest.requestedLength
-            // 🌟 防溢出逻辑：避免越界导致某些 CDN 返回 416 Range Not Satisfiable
             if length > 0 && length < 50_000_000 {
                 let endOffset = offset + Int64(length) - 1
                 request.setValue("bytes=\(offset)-\(endOffset)", forHTTPHeaderField: "Range")
@@ -94,7 +93,6 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
             return
         }
         
-        // 🌟 严格状态码校验：遇到 403 或 416 立即断开，杜绝把错误网页喂入解码器导致菊花死锁
         if httpResponse.statusCode >= 400 {
             completionHandler(.cancel)
             loadingRequest.finishLoading(with: NSError(domain: "HTTP", code: httpResponse.statusCode))
@@ -137,7 +135,7 @@ final class BiliStreamLoader: NSObject, AVAssetResourceLoaderDelegate, URLSessio
     }
 }
 
-// MARK: - 播放控制器管理器
+// MARK: - 播放核心调度器
 final class VideoPlayerManager: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var currentQualityName: String = "1080P60"
@@ -156,6 +154,7 @@ final class VideoPlayerManager: ObservableObject {
         let initVol = savedVol == 0 ? 0.8 : savedVol
         self.videoPlayer.volume = initVol
         
+        // 自动记忆音量滑块调节
         videoPlayer.publisher(for: \.volume)
             .sink { [weak self] vol in
                 UserDefaults.standard.set(vol, forKey: "bili_saved_volume")
@@ -167,26 +166,17 @@ final class VideoPlayerManager: ObservableObject {
     }
     
     private func setupSyncObserver() {
-        let interval = CMTime(seconds: 0.2, preferredTimescale: 600)
+        let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
         timeObserverToken = videoPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             guard let self = self, let audio = self.audioPlayer else { return }
             
-            // 🌟 音画就绪锁：视频缓冲首帧时，音频强制暂停等待，杜绝“只有声音无画面”
-            if self.videoPlayer.timeControlStatus == .playing {
-                if audio.timeControlStatus != .playing {
-                    audio.play()
-                }
-                let diff = abs(time.seconds - audio.currentTime().seconds)
-                if diff > 0.15 {
-                    audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
-                }
-                if self.videoPlayer.rate != audio.rate {
-                    audio.rate = self.videoPlayer.rate
-                }
-            } else if self.videoPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate {
-                audio.pause() // 视频转圈时音频原地立正等待
-            } else if self.videoPlayer.timeControlStatus == .paused {
-                audio.pause()
+            // 🌟 毫秒级音画强制对准：消除前几秒静音与音画漂移
+            let diff = abs(time.seconds - audio.currentTime().seconds)
+            if diff > 0.12 {
+                audio.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+            if self.videoPlayer.rate != audio.rate {
+                audio.rate = self.videoPlayer.rate
             }
         }
     }
@@ -223,20 +213,20 @@ final class VideoPlayerManager: ObservableObject {
                 
                 guard let dash = playInfo.dash else { return }
                 
-                // 🌟 1. 全局排除 AV1（Intel i5 无硬件解码器，播 AV1 必死锁）
+                // 🌟 1. 彻底排除 AV1，锁定 Intel i5 核显完全硬解通道 (AVC/HEVC)
                 let hardwareStreams = dash.video.filter { stream in
                     let codec = (stream.codecs ?? "").lowercased()
                     return !codec.contains("av01") && !codec.contains("av1")
                 }
                 
-                // 🌟 2. 智能流挑选：当前画质有 AVC 选 AVC；若该画质全是 AV1，自动平滑选有 AVC 的最高画质
+                // 🌟 2. 选流算法：有 AVC 选 AVC；若该画质全是 AV1，自动回退到有硬解的最高清晰度，彻底避免卡死
                 let vStream = hardwareStreams.first(where: { $0.id == activeQn && ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? hardwareStreams.first(where: { $0.id == activeQn })
                     ?? hardwareStreams.first(where: { ($0.codecs ?? "").lowercased().contains("avc") })
                     ?? hardwareStreams.first
                     ?? dash.video.first!
                 
-                // 🌟 3. CDN 优选：强制选取腾讯云(mirrorcos)或阿里云(mirrorali)主干节点，避免 PCDN 恶劣节点
+                // 🌟 3. 官方稳定 CDN 优选
                 var streamUrlStr = vStream.baseUrl
                 if let backups = vStream.backupUrl, !backups.isEmpty {
                     if let reliable = backups.first(where: { $0.contains("mirrorcos") || $0.contains("mirrorali") }) {
@@ -249,7 +239,7 @@ final class VideoPlayerManager: ObservableObject {
                 let vItem = AVPlayerItem(asset: vAsset)
                 self.videoPlayer.replaceCurrentItem(with: vItem)
                 
-                // 挂载音频轨（同理优选稳定节点）
+                // 音频轨挂载
                 if let aStream = dash.audio?.first {
                     var aUrlStr = aStream.baseUrl
                     if let aBackups = aStream.backupUrl, !aBackups.isEmpty {
@@ -274,7 +264,9 @@ final class VideoPlayerManager: ObservableObject {
                     }
                 }
                 
+                // 音画同时即刻起跑，杜绝前几秒静音
                 self.videoPlayer.play()
+                self.audioPlayer?.play()
                 self.isPlaying = true
             } catch {
                 print("加载视频流失败: \(error)")
