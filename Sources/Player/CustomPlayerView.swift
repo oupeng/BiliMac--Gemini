@@ -1,7 +1,7 @@
 import SwiftUI
 import AVKit
 
-// MARK: - 接入 macOS 原生系统级毛玻璃悬浮播放器 (图 2 截图同款控件)
+// MARK: - 接入 macOS 原生系统级毛玻璃浮动控制栏
 struct NativePlayerViewWrapper: NSViewRepresentable {
     let player: AVPlayer
     
@@ -9,8 +9,9 @@ struct NativePlayerViewWrapper: NSViewRepresentable {
         let playerView = AVPlayerView()
         playerView.player = player
         
-        // 🌟 启用截图同款的 macOS 原生毛玻璃半透明浮动面板 (带音量滑块、AirPlay、进度条)
+        // 🌟 启用图 2 原生半透明浮动面板 (单流合成后，左上角音量条与画中画将自动浮现)
         playerView.controlsStyle = .floating
+        playerView.allowsPictureInPicturePlayback = true
         playerView.showsFullScreenToggleButton = true
         playerView.showsSharingServiceButton = false
         playerView.videoGravity = .resizeAspect
