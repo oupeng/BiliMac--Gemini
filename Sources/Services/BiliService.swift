@@ -6,7 +6,7 @@ final class BiliService {
     
     private func createRequest(url: URL) -> URLRequest {
         var req = URLRequest(url: url)
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
+        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
         req.setValue("https://www.bilibili.com", forHTTPHeaderField: "Referer")
         let cookie = CookieManager.shared.cookieHeader
         if !cookie.isEmpty {
@@ -237,13 +237,13 @@ final class BiliService {
         }
     }
     
-    // MARK: - 真正获取大会员高画质（强制启用现代 DASH 架构，支持 4K / 1080P60 / 1080P+）
-    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 116) async throws -> VideoPlayUrlResponse {
+    // MARK: - 完整 4K 与高规格流（fnval 传 4048 激活全长，杜绝 10 秒截断）
+    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 120) async throws -> VideoPlayUrlResponse {
         let params: [String: String] = [
             "bvid": bvid,
             "cid": "\(cid)",
             "qn": "\(qn)",
-            "fnval": "16", // 🌟 16 强制开启标准 DASH，彻底解除 720P 封顶限制
+            "fnval": "4048", // 🌟 包含 128(4K) 与完整 DASH 标识，彻底解禁全长长视频
             "fnver": "0",
             "fourk": "1"
         ]
