@@ -246,15 +246,17 @@ final class BiliService {
         }
     }
     
-    // MARK: - 获取流媒体地址 (支持大会员自动回退)
-    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 120) async throws -> VideoPlayUrlResponse {
+    // MARK: - 获取流媒体地址 (请求合规原生 MP4 单流，彻底支持硬件解码)
+    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 80) async throws -> VideoPlayUrlResponse {
         let params: [String: String] = [
             "bvid": bvid,
             "cid": "\(cid)",
             "qn": "\(qn)",
-            "fnval": "4048", // 启用 DASH，支持 4K/1080P60
+            "fnval": "1", // 优先单文件完整 MP4 直链
             "fnver": "0",
-            "fourk": "1"
+            "fourk": "1",
+            "platform": "html5",
+            "high_quality": "1"
         ]
         let signed = WbiSigner.sign(params: params)
         var comp = URLComponents(string: "https://api.bilibili.com/x/player/wbi/playurl")!
