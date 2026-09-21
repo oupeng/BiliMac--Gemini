@@ -1,7 +1,7 @@
 import SwiftUI
 import AVKit
 
-// MARK: - 现代 macOS 原生内嵌播放器控件 (Inline 风格)
+// MARK: - 接入现代 macOS 原生播放控件 (你截图中的原生控件样式)
 struct NativePlayerViewRepresentable: NSViewRepresentable {
     let player: AVPlayer
     
@@ -9,10 +9,12 @@ struct NativePlayerViewRepresentable: NSViewRepresentable {
         let playerView = AVPlayerView()
         playerView.player = player
         
-        // 🌟 启用 macOS 现代内嵌风格交互栏 (带原生现代进度条、音量控制、画中画与全屏)
+        // 🌟 启用 macOS 现代系统级原生控制栏（带 15s 进退、原生进度条、全屏、画中画）
         playerView.controlsStyle = .inline
         playerView.showsFullScreenToggleButton = true
+        playerView.showsFrameSteppingButtons = false
         playerView.videoGravity = .resizeAspect
+        
         return playerView
     }
     
