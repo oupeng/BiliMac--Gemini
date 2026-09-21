@@ -15,7 +15,6 @@ final class BiliService {
         return req
     }
     
-    // MARK: - 用户信息与 WBI Key 更新
     func fetchUserInfo() async throws -> UserInfo {
         let url = URL(string: "https://api.bilibili.com/x/web-interface/nav")!
         let req = createRequest(url: url)
@@ -37,17 +36,16 @@ final class BiliService {
             }
         }
         
-        let isLogin = dataDict["isLogin"] as? Bool ?? false
-        let uname = dataDict["uname"] as? String ?? "用户"
-        let face = dataDict["face"] as? String ?? ""
-        let mid = dataDict["mid"] as? Int64 ?? 0
-        let vipType = dataDict["vipType"] as? Int ?? 0
-        let vipStatus = dataDict["vipStatus"] as? Int ?? 0
-        
-        return UserInfo(isLogin: isLogin, uname: uname, face: face, mid: mid, vipType: vipType, vipStatus: vipStatus)
+        return UserInfo(
+            isLogin: dataDict["isLogin"] as? Bool ?? false,
+            uname: dataDict["uname"] as? String ?? "用户",
+            face: dataDict["face"] as? String ?? "",
+            mid: dataDict["mid"] as? Int64 ?? 0,
+            vipType: dataDict["vipType"] as? Int ?? 0,
+            vipStatus: dataDict["vipStatus"] as? Int ?? 0
+        )
     }
     
-    // MARK: - 推荐视频
     func fetchRecommendVideos() async throws -> [VideoItem] {
         let baseParams = ["fresh_type": "3", "ps": "20", "fresh_idx": "1"]
         let signed = WbiSigner.sign(params: baseParams)
@@ -58,9 +56,7 @@ final class BiliService {
         let (data, _) = try await session.data(for: req)
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let dataObj = json["data"] as? [String: Any],
-              let items = dataObj["item"] as? [[String: Any]] else {
-            return []
-        }
+              let items = dataObj["item"] as? [[String: Any]] else { return [] }
         
         return items.compactMap { d in
             guard let bvid = d["bvid"] as? String,
@@ -82,7 +78,6 @@ final class BiliService {
         }
     }
     
-    // MARK: - 热门视频
     func fetchPopularVideos() async throws -> [VideoItem] {
         let url = URL(string: "https://api.bilibili.com/x/web-interface/popular?ps=20&pn=1")!
         let req = createRequest(url: url)
@@ -111,7 +106,6 @@ final class BiliService {
         }
     }
     
-    // MARK: - 稍后再看
     func fetchWatchLater() async throws -> [VideoItem] {
         let url = URL(string: "https://api.bilibili.com/x/v2/history/toview")!
         let req = createRequest(url: url)
@@ -140,7 +134,6 @@ final class BiliService {
         }
     }
     
-    // MARK: - 收藏夹
     func fetchFavoriteFolders(mid: Int64) async throws -> [FavoriteFolder] {
         let url = URL(string: "https://api.bilibili.com/x/v3/fav/folder/created/list-all?up_mid=\(mid)")!
         let req = createRequest(url: url)
@@ -184,7 +177,6 @@ final class BiliService {
         }
     }
     
-    // MARK: - 视频详情
     func fetchVideoDetail(bvid: String) async throws -> VideoDetail {
         let url = URL(string: "https://api.bilibili.com/x/web-interface/view?bvid=\(bvid)")!
         let req = createRequest(url: url)
@@ -218,7 +210,6 @@ final class BiliService {
         )
     }
     
-    // MARK: - 相关视频推荐
     func fetchRelatedVideos(bvid: String) async throws -> [VideoItem] {
         let url = URL(string: "https://api.bilibili.com/x/web-interface/archive/related?bvid=\(bvid)")!
         let req = createRequest(url: url)
@@ -246,17 +237,15 @@ final class BiliService {
         }
     }
     
-    // MARK: - 获取流媒体地址 (请求合规原生 MP4 单流，彻底支持硬件解码)
-    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 80) async throws -> VideoPlayUrlResponse {
+    // MARK: - 真正获取大会员高画质（强制启用现代 DASH 架构，支持 4K / 1080P60 / 1080P+）
+    func fetchPlayUrl(bvid: String, cid: Int, qn: Int = 116) async throws -> VideoPlayUrlResponse {
         let params: [String: String] = [
             "bvid": bvid,
             "cid": "\(cid)",
             "qn": "\(qn)",
-            "fnval": "1", // 优先单文件完整 MP4 直链
+            "fnval": "16", // 🌟 16 强制开启标准 DASH，彻底解除 720P 封顶限制
             "fnver": "0",
-            "fourk": "1",
-            "platform": "html5",
-            "high_quality": "1"
+            "fourk": "1"
         ]
         let signed = WbiSigner.sign(params: params)
         var comp = URLComponents(string: "https://api.bilibili.com/x/player/wbi/playurl")!
@@ -273,7 +262,6 @@ final class BiliService {
         return try JSONDecoder().decode(VideoPlayUrlResponse.self, from: jsonData)
     }
     
-    // MARK: - 获取评论区
     func fetchComments(aid: Int, page: Int = 1) async throws -> [BiliComment] {
         let url = URL(string: "https://api.bilibili.com/x/v2/reply?type=1&oid=\(aid)&pn=\(page)&ps=20&sort=1")!
         let req = createRequest(url: url)
@@ -330,7 +318,6 @@ final class BiliService {
         }
     }
     
-    // MARK: - 登录接口
     func generateQRCode() async throws -> (url: String, key: String) {
         let url = URL(string: "https://passport.bilibili.com/x/passport-login/web/qrcode/generate")!
         let req = createRequest(url: url)
